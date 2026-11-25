@@ -1,3 +1,4 @@
+
 name: GLOBAL PROFIT AI - Paper Trading
 
 on:
@@ -24,4 +25,4 @@ jobs:
           pip install ccxt
 
       - name: Run trading bot
-        run: python main.py
+        run: python bot_v2.py
