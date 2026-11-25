@@ -7,19 +7,20 @@ import time
 from datetime import datetime, timezone
 
 # ==========================================================
-# GLOBAL PROFIT AI TITAN V3
-# Binance Spot | Paper Trading Only | Multi-timeframe scanner
+# GLOBAL PROFIT AI TITAN V4
+# Kraken Spot | Paper Trading Only | Multi-timeframe scanner
 # One scan per GitHub Actions run; schedule the workflow every 5 min.
+# No API keys are required: this bot uses public market data only.
 # ==========================================================
 
 CONFIG = {
-    "exchange": "binance",
+    "exchange": "kraken",
     "quote": "USDT",
     "entry_timeframe": "1m",
     "confirm_timeframes": ["5m", "15m"],
     "scan_interval": 300,
     "max_symbols": 25,
-    "max_concurrent": 4,
+    "max_concurrent": 2,
     "refresh_symbols_seconds": 900,
     "starting_balance": 1000.0,
     "trade_amount": 25.0,
@@ -30,12 +31,12 @@ CONFIG = {
     "stop_atr": 1.5,
     "target_atr": 2.2,
     "max_daily_loss": 20.0,
-    "minimum_quote_volume": 1_000_000,
+    "minimum_quote_volume": 250_000,
     "minimum_atr_percent": 0.08,
     "maximum_atr_percent": 3.0,
     "paper_mode": True,
-    "state_file": "titan_state.json",
-    "trades_file": "titan_trades.jsonl",
+    "state_file": "titan_kraken_state.json",
+    "trades_file": "titan_kraken_trades.jsonl",
 }
 
 logging.basicConfig(
@@ -64,7 +65,8 @@ def utc_now():
 
 def save_state():
     state = {
-        "version": 3,
+        "version": 4,
+        "exchange": CONFIG["exchange"],
         "balance": balance,
         "positions": positions,
         "daily_profit": daily_profit,
@@ -83,11 +85,14 @@ def load_state():
     global balance, positions, daily_profit, daily_date
     path = CONFIG["state_file"]
     if not os.path.exists(path):
-        logging.info("Starting a new V3 paper account")
+        logging.info("Starting a new Kraken V4 paper account")
         return
 
     with open(path, "r", encoding="utf-8") as f:
         state = json.load(f)
+
+    if state.get("exchange") not in (None, CONFIG["exchange"]):
+        raise ValueError("Saved state belongs to a different exchange")
 
     loaded_balance = float(state["balance"])
     loaded_positions = state["positions"]
@@ -96,9 +101,12 @@ def load_state():
 
     if loaded_balance < 0 or not isinstance(loaded_positions, dict):
         raise ValueError("Invalid paper account state")
+
     for symbol, p in loaded_positions.items():
-        required = ("entry", "quantity", "cost", "entry_fee", "stop", "target",
-                    "entry_candle", "last_checked_candle")
+        required = (
+            "entry", "quantity", "cost", "entry_fee", "stop", "target",
+            "entry_candle", "last_checked_candle",
+        )
         if not isinstance(p, dict) or any(k not in p for k in required):
             raise ValueError(f"Invalid saved position: {symbol}")
 
@@ -106,8 +114,10 @@ def load_state():
     positions = loaded_positions
     daily_profit = loaded_daily_profit
     daily_date = loaded_daily_date
-    logging.info("Restored V3 paper account: cash %.2f, open positions %d",
-                 balance, len(positions))
+    logging.info(
+        "Restored Kraken V4 paper account: cash %.2f, open positions %d",
+        balance, len(positions)
+    )
 
 
 def reset_daily_stats():
@@ -213,7 +223,11 @@ def analyze_entry(candles, trend_5m, trend_15m):
         score += 1
         reasons.append("15M CONFIRM")
 
-    if not (CONFIG["minimum_atr_percent"] <= atr_pct <= CONFIG["maximum_atr_percent"]):
+    if not (
+        CONFIG["minimum_atr_percent"]
+        <= atr_pct
+        <= CONFIG["maximum_atr_percent"]
+    ):
         return None
 
     return {
@@ -247,18 +261,36 @@ async def get_symbols(exchange):
             continue
         if market.get("quote") != CONFIG["quote"]:
             continue
+
         base = market.get("base") or ""
         if any(base.endswith(suffix) for suffix in excluded):
             continue
+
         ticker = tickers.get(symbol) or {}
-        quote_volume = ticker.get("quoteVolume") or 0
+        quote_volume = ticker.get("quoteVolume")
+        if quote_volume is None:
+            continue
+        try:
+            quote_volume = float(quote_volume)
+        except (TypeError, ValueError):
+            continue
+
         if quote_volume >= CONFIG["minimum_quote_volume"]:
-            candidates.append((symbol, float(quote_volume)))
+            candidates.append((symbol, quote_volume))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     cached_symbols = [s for s, _ in candidates[:CONFIG["max_symbols"]]]
     last_symbol_refresh = now
-    logging.info("Selected %d liquid spot pairs", len(cached_symbols))
+
+    logging.info(
+        "Kraken: selected %d liquid %s spot pairs",
+        len(cached_symbols), CONFIG["quote"]
+    )
+    if not cached_symbols:
+        logging.warning(
+            "No Kraken spot pairs passed the quote/volume filters. "
+            "Check available USDT markets and volume threshold."
+        )
     return cached_symbols
 
 
@@ -266,7 +298,9 @@ async def get_symbols(exchange):
 
 async def fetch_candles(exchange, symbol, timeframe, limit=100):
     async with semaphore:
-        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        return await exchange.fetch_ohlcv(
+            symbol, timeframe=timeframe, limit=limit
+        )
 
 
 async def analyze_symbol(exchange, symbol):
@@ -276,15 +310,17 @@ async def analyze_symbol(exchange, symbol):
             fetch_candles(exchange, symbol, "5m", 100),
             fetch_candles(exchange, symbol, "15m", 100),
         )
+
         trend5 = timeframe_trend(five)
         trend15 = timeframe_trend(fifteen)
         result = analyze_entry(one, trend5, trend15)
 
-        # Keep a history of closed 1m candles. This lets position management
-        # inspect every candle since the previous scheduled GitHub run.
+        # Keep closed 1m candles so position management can inspect
+        # candles since the previous scheduled GitHub Actions run.
         closed = one[:-1]
         if len(closed) < 2:
             return None
+
         latest = closed[-1]
         if result is None:
             result = {
@@ -298,6 +334,7 @@ async def analyze_symbol(exchange, symbol):
                 "volume_ratio": 0.0,
                 "reasons": [],
             }
+
         result["closed_candles"] = [
             {
                 "time": int(c[0]),
@@ -309,9 +346,10 @@ async def analyze_symbol(exchange, symbol):
         ]
         result["symbol"] = symbol
         return result
+
     except Exception as exc:
         logging.warning("ANALYSIS ERROR %s: %s", symbol, exc)
-    return None
+        return None
 
 
 # ----------------------- HISTORY --------------------------
@@ -328,13 +366,20 @@ def save_trade(record):
 
 def open_paper_trade(signal):
     global balance
-    symbol, market_price, volatility = signal["symbol"], signal["price"], signal["atr"]
+
+    symbol = signal["symbol"]
+    market_price = signal["price"]
+    volatility = signal["atr"]
+
     if symbol in positions or len(positions) >= CONFIG["max_positions"]:
         return False
-    if market_price <= 0 or volatility <= 0:
+    if market_price <= 0 or volatility is None or volatility <= 0:
         return False
 
-    amount = min(CONFIG["trade_amount"], balance / (1 + CONFIG["fee_percent"] / 100))
+    amount = min(
+        CONFIG["trade_amount"],
+        balance / (1 + CONFIG["fee_percent"] / 100)
+    )
     if amount < 5:
         return False
 
@@ -342,7 +387,6 @@ def open_paper_trade(signal):
     execution = market_price * (1 + CONFIG["slippage_percent"] / 100)
     quantity = amount / execution
 
-    # Stops and targets are anchored to simulated fill price.
     stop = execution - CONFIG["stop_atr"] * volatility
     target = execution + CONFIG["target_atr"] * volatility
     if stop <= 0 or target <= execution:
@@ -359,15 +403,20 @@ def open_paper_trade(signal):
         "last_checked_candle": signal["candle_time"],
         "opened": utc_now(),
     }
+
     balance -= amount + fee
     save_state()
-    logging.warning("PAPER BUY %s | entry %.8f | score %d/6",
-                    symbol, execution, signal["score"])
+
+    logging.warning(
+        "PAPER BUY %s | entry %.8f | score %d/6",
+        symbol, execution, signal["score"]
+    )
     return True
 
 
 def close_paper_trade(symbol, market_price, reason):
     global balance, daily_profit
+
     position = positions.get(symbol)
     if not position:
         return
@@ -376,10 +425,12 @@ def close_paper_trade(symbol, market_price, reason):
     revenue = position["quantity"] * execution
     exit_fee = revenue * CONFIG["fee_percent"] / 100
     pnl = revenue - exit_fee - position["cost"] - position["entry_fee"]
+
     balance += revenue - exit_fee
     daily_profit += pnl
 
     save_trade({
+        "exchange": "kraken",
         "symbol": symbol,
         "entry": position["entry"],
         "exit": execution,
@@ -389,10 +440,14 @@ def close_paper_trade(symbol, market_price, reason):
         "time": utc_now(),
         "mode": "PAPER",
     })
+
     del positions[symbol]
     save_state()
-    logging.warning("PAPER SELL %s | %s | PNL %.5f USDT",
-                    symbol, reason, pnl)
+
+    logging.warning(
+        "PAPER SELL %s | %s | PNL %.5f USDT",
+        symbol, reason, pnl
+    )
 
 
 # ------------------- POSITION CONTROL ---------------------
@@ -404,14 +459,14 @@ def check_positions(signals):
     for symbol in list(positions):
         signal = by_symbol.get(symbol)
         if not signal:
-            logging.warning("POSITION NOT CHECKED: no fresh candle data for %s", symbol)
+            logging.warning(
+                "POSITION NOT CHECKED: no fresh candle data for %s", symbol
+            )
             continue
 
         p = positions[symbol]
         candles = signal.get("closed_candles", [])
 
-        # If the last processed candle is older than the available history,
-        # the bot cannot know whether a stop/target was touched in the missing gap.
         if candles and p["last_checked_candle"] < candles[0]["time"] - candle_ms:
             logging.error(
                 "CANDLE HISTORY GAP for %s: last checked %s, oldest available %s. "
@@ -428,8 +483,8 @@ def check_positions(signals):
 
             low, high = candle["low"], candle["high"]
 
-            # Process candles chronologically. If both levels were touched
-            # within one candle, assume the stop was hit first (conservative).
+            # Conservative assumption: stop is hit first if both levels
+            # were touched inside the same 1m candle.
             if low <= p["stop"]:
                 p["last_checked_candle"] = candle_time
                 close_paper_trade(symbol, p["stop"], "STOP LOSS")
@@ -456,16 +511,22 @@ def estimate_equity(signals):
 
 async def scan_market(exchange):
     reset_daily_stats()
+
     symbols = await get_symbols(exchange)
-    # Always include open positions, even if they leave the liquid-pair shortlist.
+    # Always include open positions even if they leave the liquid-pair shortlist.
     symbols = list(dict.fromkeys(symbols + list(positions.keys())))
-    logging.info("Scanning %d pairs", len(symbols))
+    logging.info("Scanning %d Kraken pairs", len(symbols))
+
+    if not symbols:
+        logging.warning("No symbols available to scan; ending this run safely.")
+        return
 
     results = await asyncio.gather(
         *(analyze_symbol(exchange, symbol) for symbol in symbols),
         return_exceptions=True,
     )
     signals = [x for x in results if isinstance(x, dict)]
+
     check_positions(signals)
 
     if daily_profit <= -CONFIG["max_daily_loss"]:
@@ -484,36 +545,65 @@ async def scan_market(exchange):
             break
         if signal["symbol"] in positions:
             continue
-        logging.info("SIGNAL %s | score %d/6 | RSI %.1f | volume x%.2f | %s",
-                     signal["symbol"], signal["score"], signal["rsi"],
-                     signal["volume_ratio"], ", ".join(signal["reasons"]))
+
+        logging.info(
+            "SIGNAL %s | score %d/6 | RSI %.1f | volume x%.2f | %s",
+            signal["symbol"], signal["score"], signal["rsi"],
+            signal["volume_ratio"], ", ".join(signal["reasons"])
+        )
         open_paper_trade(signal)
 
-    logging.info("CASH %.2f | EQUITY %.2f | REALIZED DAILY PNL %.2f | OPEN %d",
-                 balance, estimate_equity(signals), daily_profit, len(positions))
+    logging.info(
+        "CASH %.2f | EQUITY %.2f | REALIZED DAILY PNL %.2f | OPEN %d",
+        balance, estimate_equity(signals), daily_profit, len(positions)
+    )
     save_state()
 
 
 async def main():
     if CONFIG["paper_mode"] is not True:
-        raise RuntimeError("Live trading is intentionally disabled in V3.")
+        raise RuntimeError("Live trading is intentionally disabled in V4.")
 
     load_state()
+
     exchange_class = getattr(ccxt, CONFIG["exchange"])
     exchange = exchange_class({
         "enableRateLimit": True,
         "timeout": 30000,
         "options": {"defaultType": "spot"},
     })
+
     try:
+        logging.info("Connecting to Kraken public market data...")
         await exchange.load_markets()
-        logging.info("GLOBAL PROFIT AI TITAN V3 STARTED | PAPER ONLY")
+
+        usdt_spot_markets = [
+            symbol
+            for symbol, market in exchange.markets.items()
+            if market.get("spot") is True
+            and market.get("active") is not False
+            and market.get("quote") == CONFIG["quote"]
+        ]
+
+        logging.info(
+            "Kraken markets loaded: %d active %s spot pairs",
+            len(usdt_spot_markets), CONFIG["quote"]
+        )
+
+        if not usdt_spot_markets:
+            raise RuntimeError(
+                "Kraken returned no active USDT spot markets. "
+                "Check quote currency availability before proceeding."
+            )
+
+        logging.info("GLOBAL PROFIT AI TITAN V4 STARTED | PAPER ONLY")
         await scan_market(exchange)
         logging.info("SCAN COMPLETED")
+
     finally:
         save_state()
         await exchange.close()
-        logging.info("TITAN V3 STOPPED")
+        logging.info("TITAN V4 STOPPED")
 
 
 if __name__ == "__main__":
