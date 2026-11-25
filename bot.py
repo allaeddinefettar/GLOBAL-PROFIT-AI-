@@ -6,17 +6,19 @@ import os
 import time
 from datetime import datetime, timezone
 
-# ==========================================
-# GLOBAL PROFIT AI TITAN V2
-# SPOT ONLY | PAPER TRADING
-# ==========================================
+# ==========================================================
+# GLOBAL PROFIT AI TITAN V3
+# Binance Spot | Paper Trading Only | Multi-timeframe scanner
+# One scan per GitHub Actions run; schedule the workflow every 5 min.
+# ==========================================================
 
 CONFIG = {
     "exchange": "binance",
     "quote": "USDT",
-    "timeframe": "1m",
-    "scan_interval": 30,  # Retained for configuration; GitHub runs one scan per job.
-    "max_symbols": 20,
+    "entry_timeframe": "1m",
+    "confirm_timeframes": ["5m", "15m"],
+    "scan_interval": 300,
+    "max_symbols": 25,
     "max_concurrent": 4,
     "refresh_symbols_seconds": 900,
     "starting_balance": 1000.0,
@@ -24,10 +26,13 @@ CONFIG = {
     "max_positions": 3,
     "fee_percent": 0.10,
     "slippage_percent": 0.05,
-    "minimum_score": 3,
-    "stop_atr": 1.2,
-    "target_atr": 1.8,
+    "minimum_score": 4,
+    "stop_atr": 1.5,
+    "target_atr": 2.2,
     "max_daily_loss": 20.0,
+    "minimum_quote_volume": 1_000_000,
+    "minimum_atr_percent": 0.08,
+    "maximum_atr_percent": 3.0,
     "paper_mode": True,
     "state_file": "titan_state.json",
     "trades_file": "titan_trades.jsonl",
@@ -47,26 +52,29 @@ positions = {}
 daily_profit = 0.0
 daily_date = datetime.now(timezone.utc).date().isoformat()
 cached_symbols = []
-last_symbol_refresh = 0
+last_symbol_refresh = 0.0
 semaphore = asyncio.Semaphore(CONFIG["max_concurrent"])
 
 
-# ==========================================
-# STATE MANAGEMENT
-# ==========================================
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# -------------------------- STATE --------------------------
 
 def save_state():
     state = {
+        "version": 3,
         "balance": balance,
         "positions": positions,
         "daily_profit": daily_profit,
         "daily_date": daily_date,
     }
-    temporary = CONFIG["state_file"] + ".tmp"
+    tmp = CONFIG["state_file"] + ".tmp"
     try:
-        with open(temporary, "w", encoding="utf-8") as file:
-            json.dump(state, file, ensure_ascii=False, indent=2)
-        os.replace(temporary, CONFIG["state_file"])
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG["state_file"])
     except Exception:
         logging.exception("STATE SAVE ERROR")
 
@@ -74,286 +82,274 @@ def save_state():
 def load_state():
     global balance, positions, daily_profit, daily_date
     path = CONFIG["state_file"]
-
     if not os.path.exists(path):
-        logging.info("Starting with a new paper account")
+        logging.info("Starting a new V3 paper account")
         return
 
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            state = json.load(file)
+    with open(path, "r", encoding="utf-8") as f:
+        state = json.load(f)
 
-        saved_balance = float(state["balance"])
-        saved_positions = state["positions"]
+    loaded_balance = float(state["balance"])
+    loaded_positions = state["positions"]
+    loaded_daily_profit = float(state.get("daily_profit", 0.0))
+    loaded_daily_date = state.get("daily_date", daily_date)
 
-        if saved_balance < 0 or not isinstance(saved_positions, dict):
-            raise ValueError("Invalid saved account state")
+    if loaded_balance < 0 or not isinstance(loaded_positions, dict):
+        raise ValueError("Invalid paper account state")
+    for symbol, p in loaded_positions.items():
+        required = ("entry", "quantity", "cost", "entry_fee", "stop", "target",
+                    "entry_candle", "last_checked_candle")
+        if not isinstance(p, dict) or any(k not in p for k in required):
+            raise ValueError(f"Invalid saved position: {symbol}")
 
-        balance = saved_balance
-        positions = saved_positions
-        daily_profit = float(state["daily_profit"])
-        daily_date = state["daily_date"]
-
-        logging.info("Previous paper account restored")
-    except Exception:
-        logging.exception(
-            "Could not restore account state. Check titan_state.json."
-        )
-        raise
+    balance = loaded_balance
+    positions = loaded_positions
+    daily_profit = loaded_daily_profit
+    daily_date = loaded_daily_date
+    logging.info("Restored V3 paper account: cash %.2f, open positions %d",
+                 balance, len(positions))
 
 
 def reset_daily_stats():
     global daily_profit, daily_date
     today = datetime.now(timezone.utc).date().isoformat()
-
     if today != daily_date:
         daily_date = today
         daily_profit = 0.0
         save_state()
-        logging.info("New UTC trading day started")
+        logging.info("New UTC trading day")
 
 
-# ==========================================
-# TECHNICAL INDICATORS
-# ==========================================
+# --------------------- INDICATORS -------------------------
 
 def ema(values, period):
     if len(values) < period:
         return None
-
-    result = sum(values[:period]) / period
-    multiplier = 2 / (period + 1)
-
-    for value in values[period:]:
-        result = value * multiplier + result * (1 - multiplier)
-
-    return result
+    value = sum(values[:period]) / period
+    alpha = 2.0 / (period + 1)
+    for x in values[period:]:
+        value = alpha * x + (1.0 - alpha) * value
+    return value
 
 
-def calculate_rsi(values, period=14):
-    if len(values) <= period:
+def rsi(values, period=14):
+    if len(values) < period + 1:
         return None
-
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
-
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(x, 0.0) for x in changes]
+    losses = [max(-x, 0.0) for x in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = ((period - 1) * avg_gain + gains[i]) / period
+        avg_loss = ((period - 1) * avg_loss + losses[i]) / period
     if avg_loss == 0:
-        return 100.0
-
+        return 100.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def calculate_atr(candles, period=14):
+def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
-
     ranges = []
     for i in range(1, len(candles)):
-        high = candles[i][2]
-        low = candles[i][3]
-        previous_close = candles[i - 1][4]
-
-        true_range = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
-        )
-        ranges.append(true_range)
-
+        high, low, prev_close = candles[i][2], candles[i][3], candles[i - 1][4]
+        ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
     return sum(ranges[-period:]) / period
 
 
-# ==========================================
-# MARKET ANALYSIS
-# ==========================================
+def timeframe_trend(candles):
+    # Ignore the live, not-yet-closed candle.
+    closed = candles[:-1]
+    if len(closed) < 30:
+        return None
+    closes = [c[4] for c in closed]
+    fast, slow = ema(closes, 9), ema(closes, 21)
+    if fast is None or slow is None:
+        return None
+    return fast > slow and closes[-1] > fast
 
-def analyze_candles(candles):
-    # Ignore the currently forming candle.
-    if not candles or len(candles) < 36:
+
+def analyze_entry(candles, trend_5m, trend_15m):
+    if len(candles) < 40 or trend_5m is None or trend_15m is None:
         return None
 
     closed = candles[:-1]
     closes = [c[4] for c in closed]
     volumes = [c[5] for c in closed]
     price = closes[-1]
+    fast, slow = ema(closes, 9), ema(closes, 21)
+    strength = rsi(closes)
+    volatility = atr(closed)
 
-    fast = ema(closes, 9)
-    slow = ema(closes, 21)
-    strength = calculate_rsi(closes)
-    atr = calculate_atr(closed)
-
-    if any(x is None for x in (fast, slow, strength, atr)):
+    if any(x is None for x in (fast, slow, strength, volatility)):
+        return None
+    if price <= 0 or volatility <= 0:
         return None
 
-    if price <= 0 or atr <= 0:
-        return None
+    avg_volume = sum(volumes[-21:-1]) / 20
+    volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 else 0.0
+    prior_high = max(c[2] for c in closed[-21:-1])
+    atr_pct = (volatility / price) * 100.0
 
-    average_volume = sum(volumes[-21:-1]) / 20
-    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 0
-
-    previous_high = max(candle[2] for candle in closed[-21:-1])
-
-    score = 0
-    reasons = []
-
-    if fast > slow:
+    score, reasons = 0, []
+    if fast > slow and price > fast:
         score += 1
-        reasons.append("UPTREND")
-
+        reasons.append("1M UPTREND")
     if 50 <= strength <= 68:
         score += 1
         reasons.append("RSI MOMENTUM")
-
     if volume_ratio >= 1.3:
         score += 1
         reasons.append("VOLUME SURGE")
-
-    if price > previous_high:
+    if price > prior_high:
         score += 1
         reasons.append("BREAKOUT")
+    if trend_5m:
+        score += 1
+        reasons.append("5M CONFIRM")
+    if trend_15m:
+        score += 1
+        reasons.append("15M CONFIRM")
+
+    if not (CONFIG["minimum_atr_percent"] <= atr_pct <= CONFIG["maximum_atr_percent"]):
+        return None
 
     return {
         "price": price,
-        "atr": atr,
+        "atr": volatility,
+        "atr_percent": atr_pct,
         "rsi": strength,
         "volume_ratio": volume_ratio,
         "score": score,
         "reasons": reasons,
-        "candle_time": closed[-1][0],
-        "candle_high": closed[-1][2],
-        "candle_low": closed[-1][3],
+        "candle_time": int(closed[-1][0]),
+        "candle_high": float(closed[-1][2]),
+        "candle_low": float(closed[-1][3]),
     }
 
 
-# ==========================================
-# MARKET SELECTION
-# ==========================================
+# ---------------------- SYMBOLS ---------------------------
 
 async def get_symbols(exchange):
     global cached_symbols, last_symbol_refresh
-
     now = time.time()
-    if (
-        cached_symbols
-        and now - last_symbol_refresh < CONFIG["refresh_symbols_seconds"]
-    ):
+    if cached_symbols and now - last_symbol_refresh < CONFIG["refresh_symbols_seconds"]:
         return cached_symbols
 
     tickers = await exchange.fetch_tickers()
-    markets = exchange.markets or {}
     candidates = []
-    excluded_suffixes = ("UP", "DOWN", "BULL", "BEAR")
+    excluded = ("UP", "DOWN", "BULL", "BEAR")
 
-    for symbol, market in markets.items():
-        if market.get("spot") is not True:
-            continue
-        if market.get("active") is False:
+    for symbol, market in (exchange.markets or {}).items():
+        if market.get("spot") is not True or market.get("active") is False:
             continue
         if market.get("quote") != CONFIG["quote"]:
             continue
-
-        base = market.get("base", "")
-        if any(base.endswith(suffix) for suffix in excluded_suffixes):
+        base = market.get("base") or ""
+        if any(base.endswith(suffix) for suffix in excluded):
             continue
+        ticker = tickers.get(symbol) or {}
+        quote_volume = ticker.get("quoteVolume") or 0
+        if quote_volume >= CONFIG["minimum_quote_volume"]:
+            candidates.append((symbol, float(quote_volume)))
 
-        ticker = tickers.get(symbol)
-        if not ticker:
-            continue
-
-        volume = ticker.get("quoteVolume") or 0
-        if volume > 0:
-            candidates.append((symbol, volume))
-
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    cached_symbols = [
-        symbol for symbol, volume in candidates[:CONFIG["max_symbols"]]
-    ]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    cached_symbols = [s for s, _ in candidates[:CONFIG["max_symbols"]]]
     last_symbol_refresh = now
-
-    logging.info("Market list refreshed: %s pairs", len(cached_symbols))
+    logging.info("Selected %d liquid spot pairs", len(cached_symbols))
     return cached_symbols
 
 
-# ==========================================
-# ASYNC DATA COLLECTION
-# ==========================================
+# ------------------- DATA COLLECTION ----------------------
+
+async def fetch_candles(exchange, symbol, timeframe, limit=100):
+    async with semaphore:
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
 
 async def analyze_symbol(exchange, symbol):
-    async with semaphore:
-        try:
-            candles = await exchange.fetch_ohlcv(
-                symbol,
-                timeframe=CONFIG["timeframe"],
-                limit=60,
-            )
-            result = analyze_candles(candles)
+    try:
+        one, five, fifteen = await asyncio.gather(
+            fetch_candles(exchange, symbol, "1m", 100),
+            fetch_candles(exchange, symbol, "5m", 100),
+            fetch_candles(exchange, symbol, "15m", 100),
+        )
+        trend5 = timeframe_trend(five)
+        trend15 = timeframe_trend(fifteen)
+        result = analyze_entry(one, trend5, trend15)
 
-            if result:
-                result["symbol"] = symbol
-                return result
-
-        except Exception as error:
-            logging.warning("DATA ERROR %s: %s", symbol, error)
-
+        # Keep a history of closed 1m candles. This lets position management
+        # inspect every candle since the previous scheduled GitHub run.
+        closed = one[:-1]
+        if len(closed) < 2:
+            return None
+        latest = closed[-1]
+        if result is None:
+            result = {
+                "price": float(latest[4]),
+                "atr": None,
+                "candle_time": int(latest[0]),
+                "candle_high": float(latest[2]),
+                "candle_low": float(latest[3]),
+                "score": 0,
+                "rsi": 0.0,
+                "volume_ratio": 0.0,
+                "reasons": [],
+            }
+        result["closed_candles"] = [
+            {
+                "time": int(c[0]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+            }
+            for c in closed
+        ]
+        result["symbol"] = symbol
+        return result
+    except Exception as exc:
+        logging.warning("ANALYSIS ERROR %s: %s", symbol, exc)
     return None
 
 
-# ==========================================
-# TRADE HISTORY
-# ==========================================
+# ----------------------- HISTORY --------------------------
 
-def save_trade(data):
+def save_trade(record):
     try:
-        with open(CONFIG["trades_file"], "a", encoding="utf-8") as file:
-            file.write(json.dumps(data, ensure_ascii=False) + "\n")
+        with open(CONFIG["trades_file"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         logging.exception("TRADE HISTORY ERROR")
 
 
-# ==========================================
-# PAPER BUY
-# ==========================================
+# -------------------- PAPER EXECUTION ---------------------
 
 def open_paper_trade(signal):
     global balance
-
-    symbol = signal["symbol"]
-    price = signal["price"]
-    atr = signal["atr"]
-
-    if symbol in positions:
+    symbol, market_price, volatility = signal["symbol"], signal["price"], signal["atr"]
+    if symbol in positions or len(positions) >= CONFIG["max_positions"]:
         return False
-    if len(positions) >= CONFIG["max_positions"]:
-        return False
-    if atr <= 0 or price <= 0:
+    if market_price <= 0 or volatility <= 0:
         return False
 
-    amount = CONFIG["trade_amount"]
+    amount = min(CONFIG["trade_amount"], balance / (1 + CONFIG["fee_percent"] / 100))
+    if amount < 5:
+        return False
+
     fee = amount * CONFIG["fee_percent"] / 100
-    required = amount + fee
+    execution = market_price * (1 + CONFIG["slippage_percent"] / 100)
+    quantity = amount / execution
 
-    if balance < required:
-        return False
-
-    # Simulate adverse buy slippage.
-    execution_price = price * (1 + CONFIG["slippage_percent"] / 100)
-    quantity = amount / execution_price
-    stop = price - CONFIG["stop_atr"] * atr
-    target = price + CONFIG["target_atr"] * atr
-
-    if stop <= 0 or target <= price:
+    # Stops and targets are anchored to simulated fill price.
+    stop = execution - CONFIG["stop_atr"] * volatility
+    target = execution + CONFIG["target_atr"] * volatility
+    if stop <= 0 or target <= execution:
         return False
 
     positions[symbol] = {
-        "entry": execution_price,
+        "entry": execution,
         "quantity": quantity,
         "cost": amount,
         "entry_fee": fee,
@@ -361,217 +357,170 @@ def open_paper_trade(signal):
         "target": target,
         "entry_candle": signal["candle_time"],
         "last_checked_candle": signal["candle_time"],
-        "opened": datetime.now(timezone.utc).isoformat(),
+        "opened": utc_now(),
     }
-
-    balance -= required
+    balance -= amount + fee
     save_state()
-
-    logging.warning(
-        "PAPER BUY %s | %.8f | SCORE %s",
-        symbol,
-        execution_price,
-        signal["score"],
-    )
+    logging.warning("PAPER BUY %s | entry %.8f | score %d/6",
+                    symbol, execution, signal["score"])
     return True
 
 
-# ==========================================
-# PAPER SELL
-# ==========================================
-
-def close_paper_trade(symbol, price, reason):
+def close_paper_trade(symbol, market_price, reason):
     global balance, daily_profit
-
     position = positions.get(symbol)
     if not position:
         return
 
-    # Simulate adverse sell slippage.
-    execution_price = price * (1 - CONFIG["slippage_percent"] / 100)
-    revenue = position["quantity"] * execution_price
+    execution = market_price * (1 - CONFIG["slippage_percent"] / 100)
+    revenue = position["quantity"] * execution
     exit_fee = revenue * CONFIG["fee_percent"] / 100
-
-    profit = (
-        revenue
-        - exit_fee
-        - position["cost"]
-        - position["entry_fee"]
-    )
-
+    pnl = revenue - exit_fee - position["cost"] - position["entry_fee"]
     balance += revenue - exit_fee
-    daily_profit += profit
+    daily_profit += pnl
 
-    result = {
+    save_trade({
         "symbol": symbol,
         "entry": position["entry"],
-        "exit": execution_price,
-        "profit_usdt": round(profit, 6),
+        "exit": execution,
+        "quantity": position["quantity"],
+        "profit_usdt": round(pnl, 6),
         "reason": reason,
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": utc_now(),
         "mode": "PAPER",
-    }
-
-    save_trade(result)
+    })
     del positions[symbol]
     save_state()
-
-    logging.warning(
-        "PAPER SELL %s | %s | PROFIT %.5f USDT",
-        symbol,
-        reason,
-        profit,
-    )
+    logging.warning("PAPER SELL %s | %s | PNL %.5f USDT",
+                    symbol, reason, pnl)
 
 
-# ==========================================
-# POSITION MANAGEMENT
-# ==========================================
+# ------------------- POSITION CONTROL ---------------------
 
 def check_positions(signals):
-    signal_map = {signal["symbol"]: signal for signal in signals}
+    by_symbol = {s["symbol"]: s for s in signals}
+    candle_ms = 60_000
 
-    for symbol in list(positions.keys()):
-        signal = signal_map.get(symbol)
+    for symbol in list(positions):
+        signal = by_symbol.get(symbol)
         if not signal:
+            logging.warning("POSITION NOT CHECKED: no fresh candle data for %s", symbol)
             continue
 
-        position = positions[symbol]
-        candle_time = signal["candle_time"]
+        p = positions[symbol]
+        candles = signal.get("closed_candles", [])
 
-        # Do not evaluate the entry candle.
-        if candle_time <= position["entry_candle"]:
-            continue
+        # If the last processed candle is older than the available history,
+        # the bot cannot know whether a stop/target was touched in the missing gap.
+        if candles and p["last_checked_candle"] < candles[0]["time"] - candle_ms:
+            logging.error(
+                "CANDLE HISTORY GAP for %s: last checked %s, oldest available %s. "
+                "Review this paper position manually.",
+                symbol, p["last_checked_candle"], candles[0]["time"]
+            )
 
-        # Avoid processing the same closed candle twice.
-        if candle_time <= position["last_checked_candle"]:
-            continue
+        for candle in candles:
+            candle_time = candle["time"]
+            if candle_time <= p["entry_candle"]:
+                continue
+            if candle_time <= p["last_checked_candle"]:
+                continue
 
-        position["last_checked_candle"] = candle_time
-        low = signal["candle_low"]
-        high = signal["candle_high"]
-        stop = position["stop"]
-        target = position["target"]
+            low, high = candle["low"], candle["high"]
 
-        # If both were touched, assume stop first.
-        if low <= stop:
-            close_paper_trade(symbol, stop, "STOP LOSS")
-        elif high >= target:
-            close_paper_trade(symbol, target, "TAKE PROFIT")
+            # Process candles chronologically. If both levels were touched
+            # within one candle, assume the stop was hit first (conservative).
+            if low <= p["stop"]:
+                p["last_checked_candle"] = candle_time
+                close_paper_trade(symbol, p["stop"], "STOP LOSS")
+                break
+            elif high >= p["target"]:
+                p["last_checked_candle"] = candle_time
+                close_paper_trade(symbol, p["target"], "TAKE PROFIT")
+                break
+            else:
+                p["last_checked_candle"] = candle_time
 
     save_state()
 
 
-# ==========================================
-# ACCOUNT MONITORING
-# ==========================================
-
-def calculate_equity(signals):
-    prices = {signal["symbol"]: signal["price"] for signal in signals}
+def estimate_equity(signals):
+    prices = {s["symbol"]: s["price"] for s in signals}
     equity = balance
-
-    for symbol, position in positions.items():
-        price = prices.get(symbol, position["entry"])
-        equity += position["quantity"] * price
-
+    for symbol, p in positions.items():
+        equity += p["quantity"] * prices.get(symbol, p["entry"])
     return equity
 
 
-# ==========================================
-# MARKET SCANNER
-# ==========================================
+# ---------------------- MAIN SCAN -------------------------
 
 async def scan_market(exchange):
-    global daily_profit
-
     reset_daily_stats()
     symbols = await get_symbols(exchange)
-
-    # Continue monitoring open positions even if they leave top-volume list.
+    # Always include open positions, even if they leave the liquid-pair shortlist.
     symbols = list(dict.fromkeys(symbols + list(positions.keys())))
+    logging.info("Scanning %d pairs", len(symbols))
 
-    logging.info("Scanning %s Spot pairs", len(symbols))
-
-    tasks = [analyze_symbol(exchange, symbol) for symbol in symbols]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    signals = [result for result in results if isinstance(result, dict)]
+    results = await asyncio.gather(
+        *(analyze_symbol(exchange, symbol) for symbol in symbols),
+        return_exceptions=True,
+    )
+    signals = [x for x in results if isinstance(x, dict)]
     check_positions(signals)
 
-    # Daily loss limit applies to new entries.
     if daily_profit <= -CONFIG["max_daily_loss"]:
-        logging.error("DAILY LOSS LIMIT REACHED. New entries paused.")
+        logging.error("DAILY LOSS LIMIT reached; entries paused")
         save_state()
         return
 
     opportunities = sorted(
-        [
-            signal for signal in signals
-            if signal["score"] >= CONFIG["minimum_score"]
-        ],
-        key=lambda item: item["score"],
+        (s for s in signals if s["score"] >= CONFIG["minimum_score"]),
+        key=lambda x: (x["score"], x["volume_ratio"]),
         reverse=True,
     )
 
     for signal in opportunities:
-        symbol = signal["symbol"]
-        if symbol in positions:
+        if len(positions) >= CONFIG["max_positions"]:
+            break
+        if signal["symbol"] in positions:
             continue
-
-        logging.info(
-            "OPPORTUNITY %s | SCORE %s | RSI %.2f | %s",
-            symbol,
-            signal["score"],
-            signal["rsi"],
-            ",".join(signal["reasons"]),
-        )
+        logging.info("SIGNAL %s | score %d/6 | RSI %.1f | volume x%.2f | %s",
+                     signal["symbol"], signal["score"], signal["rsi"],
+                     signal["volume_ratio"], ", ".join(signal["reasons"]))
         open_paper_trade(signal)
 
-    equity = calculate_equity(signals)
-    logging.info(
-        "CASH %.2f | EQUITY %.2f | DAILY PNL %.2f | POSITIONS %s",
-        balance,
-        equity,
-        daily_profit,
-        len(positions),
-    )
+    logging.info("CASH %.2f | EQUITY %.2f | REALIZED DAILY PNL %.2f | OPEN %d",
+                 balance, estimate_equity(signals), daily_profit, len(positions))
+    save_state()
 
-
-# ==========================================
-# MAIN ENGINE
-# # GitHub Actions: one scan per run
-# ==========================================
 
 async def main():
     if CONFIG["paper_mode"] is not True:
-        raise RuntimeError(
-            "Live trading is not implemented. Paper mode must remain enabled."
-        )
+        raise RuntimeError("Live trading is intentionally disabled in V3.")
 
     load_state()
     exchange_class = getattr(ccxt, CONFIG["exchange"])
     exchange = exchange_class({
         "enableRateLimit": True,
-        "timeout": 20000,
+        "timeout": 30000,
         "options": {"defaultType": "spot"},
     })
-
     try:
         await exchange.load_markets()
-        logging.info("GLOBAL PROFIT AI TITAN V2 STARTED - ONE SCAN")
+        logging.info("GLOBAL PROFIT AI TITAN V3 STARTED | PAPER ONLY")
         await scan_market(exchange)
-        logging.info("ONE SCAN COMPLETED")
-
+        logging.info("SCAN COMPLETED")
     finally:
         save_state()
         await exchange.close()
-        logging.info("TITAN ENGINE STOPPED")
+        logging.info("TITAN V3 STOPPED")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("TITAN STOPPED BY USER")
+        logging.info("Stopped by user")
     except Exception:
-        logging.exception("FATAL STARTUP ERROR")
+        logging.exception("FATAL ERROR")
+        raise
