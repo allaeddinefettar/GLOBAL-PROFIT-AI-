@@ -1,36 +1,36 @@
-
-import ccxt
-import time
+import asyncio
+import ccxt.async_support as ccxt
 import json
 import logging
+import os
+import time
 from datetime import datetime, timezone
 
 # ==========================================
-# GLOBAL PROFIT AI - PRO
-# Cross Exchange Arbitrage Intelligence
+# GLOBAL PROFIT AI TITAN V2
+# SPOT ONLY | PAPER TRADING
 # ==========================================
 
 CONFIG = {
-    "exchanges": ["binance", "bybit"],
-    "symbols": [
-        "BTC/USDT",
-        "ETH/USDT",
-        "SOL/USDT",
-        "XRP/USDT",
-        "BNB/USDT",
-        "ADA/USDT",
-        "DOGE/USDT",
-        "LTC/USDT"
-    ],
-    "quote_budget": 100.0,
-    "fee_percent": {
-        "binance": 0.10,
-        "bybit": 0.10
-    },
-    "minimum_profit_percent": 0.30,
-    "minimum_profit_usdt": 0.10,
-    "scan_interval": 60,
-    "paper_mode": True
+    "exchange": "binance",
+    "quote": "USDT",
+    "timeframe": "1m",
+    "scan_interval": 30,  # Retained for configuration; GitHub runs one scan per job.
+    "max_symbols": 20,
+    "max_concurrent": 4,
+    "refresh_symbols_seconds": 900,
+    "starting_balance": 1000.0,
+    "trade_amount": 25.0,
+    "max_positions": 3,
+    "fee_percent": 0.10,
+    "slippage_percent": 0.05,
+    "minimum_score": 3,
+    "stop_atr": 1.2,
+    "target_atr": 1.8,
+    "max_daily_loss": 20.0,
+    "paper_mode": True,
+    "state_file": "titan_state.json",
+    "trades_file": "titan_trades.jsonl",
 }
 
 logging.basicConfig(
@@ -38,191 +38,540 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("global_profit.log")
-    ]
+        logging.FileHandler("titan.log", encoding="utf-8"),
+    ],
 )
 
-def create_exchanges():
-    result = {}
+balance = CONFIG["starting_balance"]
+positions = {}
+daily_profit = 0.0
+daily_date = datetime.now(timezone.utc).date().isoformat()
+cached_symbols = []
+last_symbol_refresh = 0
+semaphore = asyncio.Semaphore(CONFIG["max_concurrent"])
 
-    for name in CONFIG["exchanges"]:
-        exchange_class = getattr(ccxt, name)
-        exchange = exchange_class({
-            "enableRateLimit": True,
-            "timeout": 15000
-        })
-        exchange.load_markets()
-        result[name] = exchange
+
+# ==========================================
+# STATE MANAGEMENT
+# ==========================================
+
+def save_state():
+    state = {
+        "balance": balance,
+        "positions": positions,
+        "daily_profit": daily_profit,
+        "daily_date": daily_date,
+    }
+    temporary = CONFIG["state_file"] + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
+        os.replace(temporary, CONFIG["state_file"])
+    except Exception:
+        logging.exception("STATE SAVE ERROR")
+
+
+def load_state():
+    global balance, positions, daily_profit, daily_date
+    path = CONFIG["state_file"]
+
+    if not os.path.exists(path):
+        logging.info("Starting with a new paper account")
+        return
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            state = json.load(file)
+
+        saved_balance = float(state["balance"])
+        saved_positions = state["positions"]
+
+        if saved_balance < 0 or not isinstance(saved_positions, dict):
+            raise ValueError("Invalid saved account state")
+
+        balance = saved_balance
+        positions = saved_positions
+        daily_profit = float(state["daily_profit"])
+        daily_date = state["daily_date"]
+
+        logging.info("Previous paper account restored")
+    except Exception:
+        logging.exception(
+            "Could not restore account state. Check titan_state.json."
+        )
+        raise
+
+
+def reset_daily_stats():
+    global daily_profit, daily_date
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    if today != daily_date:
+        daily_date = today
+        daily_profit = 0.0
+        save_state()
+        logging.info("New UTC trading day started")
+
+
+# ==========================================
+# TECHNICAL INDICATORS
+# ==========================================
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    result = sum(values[:period]) / period
+    multiplier = 2 / (period + 1)
+
+    for value in values[period:]:
+        result = value * multiplier + result * (1 - multiplier)
 
     return result
 
 
-def buy_from_asks(asks, budget):
-    remaining = budget
-    quantity = 0
-    cost = 0
-
-    for price, amount in asks:
-        take = min(amount, remaining / price)
-        quantity += take
-        cost += take * price
-        remaining -= take * price
-
-        if remaining <= 0.00000001:
-            break
-
-    if remaining > 0.01 or quantity == 0:
+def calculate_rsi(values, period=14):
+    if len(values) <= period:
         return None
 
-    return quantity, cost / quantity, cost
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
-def sell_into_bids(bids, quantity):
-    remaining = quantity
-    proceeds = 0
-
-    for price, amount in bids:
-        take = min(amount, remaining)
-        proceeds += take * price
-        remaining -= take
-
-        if remaining <= 0.00000001:
-            break
-
-    if remaining > 0.00000001:
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
         return None
 
-    return proceeds / quantity, proceeds
+    ranges = []
+    for i in range(1, len(candles)):
+        high = candles[i][2]
+        low = candles[i][3]
+        previous_close = candles[i - 1][4]
 
-
-def analyze(symbol, buy_name, sell_name, exchanges):
-    try:
-        buy_book = exchanges[buy_name].fetch_order_book(
-            symbol, limit=20
+        true_range = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close),
         )
-        sell_book = exchanges[sell_name].fetch_order_book(
-            symbol, limit=20
-        )
+        ranges.append(true_range)
 
-        if not buy_book["asks"] or not sell_book["bids"]:
-            return
+    return sum(ranges[-period:]) / period
 
-        buy = buy_from_asks(
-            buy_book["asks"],
-            CONFIG["quote_budget"]
-        )
 
-        if buy is None:
-            return
+# ==========================================
+# MARKET ANALYSIS
+# ==========================================
 
-        quantity, buy_price, cost = buy
+def analyze_candles(candles):
+    # Ignore the currently forming candle.
+    if not candles or len(candles) < 36:
+        return None
 
-        sell = sell_into_bids(
-            sell_book["bids"],
-            quantity
-        )
+    closed = candles[:-1]
+    closes = [c[4] for c in closed]
+    volumes = [c[5] for c in closed]
+    price = closes[-1]
 
-        if sell is None:
-            return
+    fast = ema(closes, 9)
+    slow = ema(closes, 21)
+    strength = calculate_rsi(closes)
+    atr = calculate_atr(closed)
 
-        sell_price, revenue = sell
+    if any(x is None for x in (fast, slow, strength, atr)):
+        return None
 
-        buy_fee = (
-            cost * CONFIG["fee_percent"][buy_name] / 100
-        )
-        sell_fee = (
-            revenue * CONFIG["fee_percent"][sell_name] / 100
-        )
+    if price <= 0 or atr <= 0:
+        return None
 
-        net_profit = revenue - cost - buy_fee - sell_fee
-        net_percent = net_profit / cost * 100
+    average_volume = sum(volumes[-21:-1]) / 20
+    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 0
 
-        result = {
-            "time": datetime.now(timezone.utc).isoformat(),
-            "symbol": symbol,
-            "buy_exchange": buy_name,
-            "sell_exchange": sell_name,
-            "quantity": quantity,
-            "buy_price": buy_price,
-            "sell_price": sell_price,
-            "net_profit_usdt": round(net_profit, 5),
-            "net_profit_percent": round(net_percent, 4),
-            "mode": "PAPER_ONLY"
-        }
+    previous_high = max(candle[2] for candle in closed[-21:-1])
 
-        logging.info(json.dumps(result))
+    score = 0
+    reasons = []
 
-        if (
-            net_profit >= CONFIG["minimum_profit_usdt"]
-            and net_percent >= CONFIG["minimum_profit_percent"]
-        ):
-            logging.warning(
-                "POTENTIAL OPPORTUNITY: %s | BUY %s | SELL %s | "
-                "NET %.4f USDT (%.3f%%)",
-                symbol, buy_name, sell_name,
-                net_profit, net_percent
+    if fast > slow:
+        score += 1
+        reasons.append("UPTREND")
+
+    if 50 <= strength <= 68:
+        score += 1
+        reasons.append("RSI MOMENTUM")
+
+    if volume_ratio >= 1.3:
+        score += 1
+        reasons.append("VOLUME SURGE")
+
+    if price > previous_high:
+        score += 1
+        reasons.append("BREAKOUT")
+
+    return {
+        "price": price,
+        "atr": atr,
+        "rsi": strength,
+        "volume_ratio": volume_ratio,
+        "score": score,
+        "reasons": reasons,
+        "candle_time": closed[-1][0],
+        "candle_high": closed[-1][2],
+        "candle_low": closed[-1][3],
+    }
+
+
+# ==========================================
+# MARKET SELECTION
+# ==========================================
+
+async def get_symbols(exchange):
+    global cached_symbols, last_symbol_refresh
+
+    now = time.time()
+    if (
+        cached_symbols
+        and now - last_symbol_refresh < CONFIG["refresh_symbols_seconds"]
+    ):
+        return cached_symbols
+
+    tickers = await exchange.fetch_tickers()
+    markets = exchange.markets or {}
+    candidates = []
+    excluded_suffixes = ("UP", "DOWN", "BULL", "BEAR")
+
+    for symbol, market in markets.items():
+        if market.get("spot") is not True:
+            continue
+        if market.get("active") is False:
+            continue
+        if market.get("quote") != CONFIG["quote"]:
+            continue
+
+        base = market.get("base", "")
+        if any(base.endswith(suffix) for suffix in excluded_suffixes):
+            continue
+
+        ticker = tickers.get(symbol)
+        if not ticker:
+            continue
+
+        volume = ticker.get("quoteVolume") or 0
+        if volume > 0:
+            candidates.append((symbol, volume))
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    cached_symbols = [
+        symbol for symbol, volume in candidates[:CONFIG["max_symbols"]]
+    ]
+    last_symbol_refresh = now
+
+    logging.info("Market list refreshed: %s pairs", len(cached_symbols))
+    return cached_symbols
+
+
+# ==========================================
+# ASYNC DATA COLLECTION
+# ==========================================
+
+async def analyze_symbol(exchange, symbol):
+    async with semaphore:
+        try:
+            candles = await exchange.fetch_ohlcv(
+                symbol,
+                timeframe=CONFIG["timeframe"],
+                limit=60,
             )
+            result = analyze_candles(candles)
 
-            with open("opportunities.jsonl", "a") as file:
-                file.write(json.dumps(result) + "\n")
+            if result:
+                result["symbol"] = symbol
+                return result
 
-    except Exception as error:
-        logging.error(
-            "%s | %s -> %s | %s",
-            symbol, buy_name, sell_name, error
-        )
+        except Exception as error:
+            logging.warning("DATA ERROR %s: %s", symbol, error)
 
-
-def scan_market(exchanges):
-    logging.info("Starting GLOBAL PROFIT AI scan")
-
-    for symbol in CONFIG["symbols"]:
-        for buy_name in exchanges:
-            for sell_name in exchanges:
-                if buy_name == sell_name:
-                    continue
-
-                analyze(
-                    symbol,
-                    buy_name,
-                    sell_name,
-                    exchanges
-                )
+    return None
 
 
-def main():
-    logging.info("GLOBAL PROFIT AI PRO STARTING")
+# ==========================================
+# TRADE HISTORY
+# ==========================================
 
-    if not CONFIG["paper_mode"]:
-        raise RuntimeError(
-            "Real trading is disabled in this version."
-        )
-
+def save_trade(data):
     try:
-        exchanges = create_exchanges()
-
-        while True:
-            start = time.time()
-
-            scan_market(exchanges)
-
-            elapsed = time.time() - start
-            wait = max(1, CONFIG["scan_interval"] - elapsed)
-
-            logging.info(
-                "Scan complete. Next scan in %.1f seconds",
-                wait
-            )
-
-            time.sleep(wait)
-
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by user.")
-
+        with open(CONFIG["trades_file"], "a", encoding="utf-8") as file:
+            file.write(json.dumps(data, ensure_ascii=False) + "\n")
     except Exception:
-        logging.exception("Fatal bot error")
-        raise
+        logging.exception("TRADE HISTORY ERROR")
+
+
+# ==========================================
+# PAPER BUY
+# ==========================================
+
+def open_paper_trade(signal):
+    global balance
+
+    symbol = signal["symbol"]
+    price = signal["price"]
+    atr = signal["atr"]
+
+    if symbol in positions:
+        return False
+    if len(positions) >= CONFIG["max_positions"]:
+        return False
+    if atr <= 0 or price <= 0:
+        return False
+
+    amount = CONFIG["trade_amount"]
+    fee = amount * CONFIG["fee_percent"] / 100
+    required = amount + fee
+
+    if balance < required:
+        return False
+
+    # Simulate adverse buy slippage.
+    execution_price = price * (1 + CONFIG["slippage_percent"] / 100)
+    quantity = amount / execution_price
+    stop = price - CONFIG["stop_atr"] * atr
+    target = price + CONFIG["target_atr"] * atr
+
+    if stop <= 0 or target <= price:
+        return False
+
+    positions[symbol] = {
+        "entry": execution_price,
+        "quantity": quantity,
+        "cost": amount,
+        "entry_fee": fee,
+        "stop": stop,
+        "target": target,
+        "entry_candle": signal["candle_time"],
+        "last_checked_candle": signal["candle_time"],
+        "opened": datetime.now(timezone.utc).isoformat(),
+    }
+
+    balance -= required
+    save_state()
+
+    logging.warning(
+        "PAPER BUY %s | %.8f | SCORE %s",
+        symbol,
+        execution_price,
+        signal["score"],
+    )
+    return True
+
+
+# ==========================================
+# PAPER SELL
+# ==========================================
+
+def close_paper_trade(symbol, price, reason):
+    global balance, daily_profit
+
+    position = positions.get(symbol)
+    if not position:
+        return
+
+    # Simulate adverse sell slippage.
+    execution_price = price * (1 - CONFIG["slippage_percent"] / 100)
+    revenue = position["quantity"] * execution_price
+    exit_fee = revenue * CONFIG["fee_percent"] / 100
+
+    profit = (
+        revenue
+        - exit_fee
+        - position["cost"]
+        - position["entry_fee"]
+    )
+
+    balance += revenue - exit_fee
+    daily_profit += profit
+
+    result = {
+        "symbol": symbol,
+        "entry": position["entry"],
+        "exit": execution_price,
+        "profit_usdt": round(profit, 6),
+        "reason": reason,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "mode": "PAPER",
+    }
+
+    save_trade(result)
+    del positions[symbol]
+    save_state()
+
+    logging.warning(
+        "PAPER SELL %s | %s | PROFIT %.5f USDT",
+        symbol,
+        reason,
+        profit,
+    )
+
+
+# ==========================================
+# POSITION MANAGEMENT
+# ==========================================
+
+def check_positions(signals):
+    signal_map = {signal["symbol"]: signal for signal in signals}
+
+    for symbol in list(positions.keys()):
+        signal = signal_map.get(symbol)
+        if not signal:
+            continue
+
+        position = positions[symbol]
+        candle_time = signal["candle_time"]
+
+        # Do not evaluate the entry candle.
+        if candle_time <= position["entry_candle"]:
+            continue
+
+        # Avoid processing the same closed candle twice.
+        if candle_time <= position["last_checked_candle"]:
+            continue
+
+        position["last_checked_candle"] = candle_time
+        low = signal["candle_low"]
+        high = signal["candle_high"]
+        stop = position["stop"]
+        target = position["target"]
+
+        # If both were touched, assume stop first.
+        if low <= stop:
+            close_paper_trade(symbol, stop, "STOP LOSS")
+        elif high >= target:
+            close_paper_trade(symbol, target, "TAKE PROFIT")
+
+    save_state()
+
+
+# ==========================================
+# ACCOUNT MONITORING
+# ==========================================
+
+def calculate_equity(signals):
+    prices = {signal["symbol"]: signal["price"] for signal in signals}
+    equity = balance
+
+    for symbol, position in positions.items():
+        price = prices.get(symbol, position["entry"])
+        equity += position["quantity"] * price
+
+    return equity
+
+
+# ==========================================
+# MARKET SCANNER
+# ==========================================
+
+async def scan_market(exchange):
+    global daily_profit
+
+    reset_daily_stats()
+    symbols = await get_symbols(exchange)
+
+    # Continue monitoring open positions even if they leave top-volume list.
+    symbols = list(dict.fromkeys(symbols + list(positions.keys())))
+
+    logging.info("Scanning %s Spot pairs", len(symbols))
+
+    tasks = [analyze_symbol(exchange, symbol) for symbol in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    signals = [result for result in results if isinstance(result, dict)]
+    check_positions(signals)
+
+    # Daily loss limit applies to new entries.
+    if daily_profit <= -CONFIG["max_daily_loss"]:
+        logging.error("DAILY LOSS LIMIT REACHED. New entries paused.")
+        save_state()
+        return
+
+    opportunities = sorted(
+        [
+            signal for signal in signals
+            if signal["score"] >= CONFIG["minimum_score"]
+        ],
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    for signal in opportunities:
+        symbol = signal["symbol"]
+        if symbol in positions:
+            continue
+
+        logging.info(
+            "OPPORTUNITY %s | SCORE %s | RSI %.2f | %s",
+            symbol,
+            signal["score"],
+            signal["rsi"],
+            ",".join(signal["reasons"]),
+        )
+        open_paper_trade(signal)
+
+    equity = calculate_equity(signals)
+    logging.info(
+        "CASH %.2f | EQUITY %.2f | DAILY PNL %.2f | POSITIONS %s",
+        balance,
+        equity,
+        daily_profit,
+        len(positions),
+    )
+
+
+# ==========================================
+# MAIN ENGINE
+# # GitHub Actions: one scan per run
+# ==========================================
+
+async def main():
+    if CONFIG["paper_mode"] is not True:
+        raise RuntimeError(
+            "Live trading is not implemented. Paper mode must remain enabled."
+        )
+
+    load_state()
+    exchange_class = getattr(ccxt, CONFIG["exchange"])
+    exchange = exchange_class({
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {"defaultType": "spot"},
+    })
+
+    try:
+        await exchange.load_markets()
+        logging.info("GLOBAL PROFIT AI TITAN V2 STARTED - ONE SCAN")
+        await scan_market(exchange)
+        logging.info("ONE SCAN COMPLETED")
+
+    finally:
+        save_state()
+        await exchange.close()
+        logging.info("TITAN ENGINE STOPPED")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("TITAN STOPPED BY USER")
+    except Exception:
+        logging.exception("FATAL STARTUP ERROR")
